@@ -35,10 +35,15 @@ def get_creds():
     with st.sidebar:
         st.header("Dhan credentials")
         if cid and tok:
-            st.success("Loaded from Streamlit secrets")
+            st.success("Credentials loaded from Streamlit secrets")
+            with st.expander("Token expired? Use a new one for now"):
+                new_tok = st.text_input("New access token (this session only)", type="password")
+                if new_tok.strip():
+                    tok = new_tok.strip()
+                    st.caption("Using the pasted token. Update Secrets to make it permanent.")
         else:
-            cid = st.text_input("Client ID", type="password")
-            tok = st.text_input("Access token", type="password")
+            cid = st.text_input("Client ID", type="password").strip()
+            tok = st.text_input("Access token", type="password").strip()
     return cid, tok
 
 
