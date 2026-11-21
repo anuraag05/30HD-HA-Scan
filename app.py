@@ -57,6 +57,13 @@ class Limiter:
 
 
 LIMITER = Limiter(4.0)  # Dhan data API allows ~5 req/sec; stay under it
+ERRS = {}
+_ERR_LOCK = threading.Lock()
+
+
+def note_err(msg):
+    with _ERR_LOCK:
+        ERRS[msg] = ERRS.get(msg, 0) + 1
 
 
 # ---------------------------------------------------------------- universe
@@ -100,14 +107,27 @@ def _post(path, body, headers):
         try:
             r = requests.post(f"{API}{path}", json=body, headers=headers, timeout=25)
             if r.status_code == 200:
-                return r.json()
+                js = r.json()
+                if not isinstance(js, dict) or not js.get("close"):
+                    note_err(f"HTTP 200 but no candle data: {str(js)[:160]}")
+                return js
             if r.status_code in (429, 805):
+                note_err(f"HTTP {r.status_code} rate limited (retrying)")
                 time.sleep(2)
                 continue
+            note_err(f"HTTP {r.status_code}: {r.text[:200]}")
             return None
-        except requests.RequestException:
+        except (requests.RequestException, ValueError) as e:
+            note_err(f"Request error: {e}")
             time.sleep(1)
     return None
+
+
+@st.cache_data(ttl=300, show_spinner="Fetching candles...")
+def cached_fetch(cid, tok, sid, tf):
+    h = {"access-token": tok, "client-id": cid, "Content-Type": "application/json",
+         "Accept": "application/json"}
+    return fetch(h, sid, tf)
 
 
 def fetch(headers, sec_id, tf):
@@ -189,6 +209,17 @@ with st.sidebar:
     workers = st.slider("Parallel workers", 1, 8, 4)
     run = st.button("Run scan", type="primary", disabled=not (client_id and token))
     st.caption("All NSE EQ is ~2,000 stocks x 3 calls; at ~4 req/s that is 25+ minutes.")
+    if st.button("Test connection", disabled=not (client_id and token)):
+        try:
+            sid0 = load_master().set_index("symbol").security_id.get("RELIANCE")
+            body = {"securityId": str(sid0), "exchangeSegment": "NSE_EQ", "instrument": "EQUITY",
+                    "expiryCode": 0, "oi": False,
+                    "fromDate": (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d"),
+                    "toDate": (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")}
+            r = requests.post(f"{API}/charts/historical", json=body, headers=headers, timeout=25)
+            st.code(f"HTTP {r.status_code}\n{r.text[:500]}")
+        except Exception as e:
+            st.code(f"Failed: {e}")
 
 if run:
     master = load_master()
@@ -203,6 +234,7 @@ if run:
     if limit:
         syms = syms[: int(limit)]
 
+    ERRS.clear()
     rows, bar = [], st.progress(0.0, text="Scanning...")
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = [ex.submit(scan_one, headers, s, m[s]) for s in syms]
@@ -215,6 +247,7 @@ if run:
     bar.empty()
     res = pd.DataFrame(rows).sort_values("Symbol").reset_index(drop=True)
     st.session_state["res"] = res
+    st.session_state["errs"] = dict(ERRS)
     st.session_state["scanned_at"] = datetime.now().strftime("%d %b %Y %H:%M")
 
 if "res" in st.session_state:
@@ -224,6 +257,11 @@ if "res" in st.session_state:
     ok = res[[f"{t} Both" for t in TFS]].ne("n/a").all(axis=1)
     if (~ok).any():
         st.warning(f"{(~ok).sum()} stocks had missing data on at least one timeframe (shown as n/a).")
+        errs = st.session_state.get("errs", {})
+        if errs:
+            st.error("Dhan API problems seen during the scan (most common first):")
+            for k, v in sorted(errs.items(), key=lambda kv: -kv[1])[:5]:
+                st.code(f"{v}x  {k}")
 
     c1, c2, c3 = st.columns(3)
     pick = c1.multiselect("Filter 'Both' on timeframe", TFS)
@@ -259,27 +297,36 @@ if "res" in st.session_state:
     fig.update_layout(barmode="group", title="Matches by timeframe", height=350)
     st.plotly_chart(fig, use_container_width=True)
 
-    # drill-down chart
-    st.subheader("Chart a stock")
-    d1, d2 = st.columns(2)
-    sym = d1.selectbox("Symbol", view.Symbol.tolist() or res.Symbol.tolist())
-    tf = d2.selectbox("Timeframe", TFS)
-    master = load_master()
-    sid = master.set_index("symbol").security_id.get(sym)
-    if sid is not None:
-        df = fetch(headers, sid, tf)
-        if df is None or df.empty:
-            st.info("No data returned for this stock/timeframe.")
-        else:
-            df = df.tail(120)
-            ha = heikin_ashi(fetch(headers, sid, tf)).tail(120)
-            x = df.index.strftime("%d-%b %H:%M")
-            f = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05,
-                              subplot_titles=("Regular candles", "Heikin-Ashi candles"))
-            f.add_trace(go.Candlestick(x=x, open=df.open, high=df.high, low=df.low, close=df.close, name="Regular"), 1, 1)
-            f.add_trace(go.Candlestick(x=x, open=ha.open, high=ha.high, low=ha.low, close=ha.close, name="HA"), 2, 1)
-            f.update_xaxes(type="category", nticks=12, rangeslider_visible=False)
-            f.update_layout(height=650, showlegend=False, title=f"{sym} - {tf}")
-            st.plotly_chart(f, use_container_width=True)
-else:
+
+if "res" not in st.session_state:
     st.info("Choose a universe in the sidebar and press **Run scan**.")
+
+# ---------------------------------------------------------------- charts (independent of scan)
+st.divider()
+st.header("Charts: regular vs Heikin-Ashi (any stock)")
+master = load_master()
+scanned = st.session_state["res"].Symbol.tolist() if "res" in st.session_state else []
+all_syms = scanned + [s_ for s_ in master.symbol if s_ not in set(scanned)]
+k1, k2 = st.columns([2, 1])
+sym = k1.selectbox("Stock", all_syms)
+bars = k2.slider("Candles to show", 30, 200, 100)
+sid = master.set_index("symbol").security_id.get(sym)
+
+if not (client_id and token):
+    st.info("Enter Dhan credentials to load charts.")
+else:
+    for tab, tf in zip(st.tabs(TFS), TFS):
+        with tab:
+            df = cached_fetch(client_id, token, sid, tf)
+            if df is None or df.empty:
+                st.warning("No data returned. Press 'Test connection' in the sidebar to see Dhan's error.")
+                continue
+            d, h = df.tail(bars), heikin_ashi(df).tail(bars)
+            x = d.index.strftime("%d-%b %H:%M")
+            f = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+                              subplot_titles=("Regular candles", "Heikin-Ashi candles"))
+            f.add_trace(go.Candlestick(x=x, open=d.open, high=d.high, low=d.low, close=d.close), 1, 1)
+            f.add_trace(go.Candlestick(x=x, open=h.open, high=h.high, low=h.low, close=h.close), 2, 1)
+            f.update_xaxes(type="category", nticks=12, rangeslider_visible=False)
+            f.update_layout(height=700, showlegend=False, title=f"{sym} - {tf}")
+            st.plotly_chart(f, use_container_width=True)
