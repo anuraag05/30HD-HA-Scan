@@ -24,7 +24,7 @@ NSE_LISTS = {
     "Nifty 100": "https://archives.nseindia.com/content/indices/ind_nifty100list.csv",
     "Nifty 500": "https://archives.nseindia.com/content/indices/ind_nifty500list.csv",
 }
-ALL_TFS = ["1D", "1H", "30m", "5m", "1m"]
+ALL_TFS = ["1D", "1H", "30m", "15m", "5m", "1m"]
 IST = "Asia/Kolkata"
 
 
@@ -162,14 +162,15 @@ def resample(df, rule):
 
 
 def get_frames(headers, sec_id, tfs=tuple(ALL_TFS)):
-    """Up to 3 API calls per stock (daily, 5m, 1m); 30m and 1H are built from the 5m data."""
+    """Up to 3 API calls per stock (daily, 5m, 1m); 15m, 30m and 1H are built from the 5m data."""
     out = {t: None for t in ALL_TFS}
     if "1D" in tfs:
         out["1D"] = fetch_raw(headers, sec_id, "D")
-    if any(t in tfs for t in ("5m", "30m", "1H")):
+    if any(t in tfs for t in ("5m", "15m", "30m", "1H")):
         m5 = fetch_raw(headers, sec_id, "5")
         if m5 is not None:
             out["5m"] = m5
+            out["15m"] = resample(m5, "15min")
             out["30m"] = resample(m5, "30min")
             out["1H"] = resample(m5, "60min")
     if "1m" in tfs:
@@ -199,7 +200,7 @@ def heikin_ashi(df):
 def classify(df):
     """Latest candle: HA colour, regular colour, and whether they agree."""
     if df is None or len(df) < 3:
-        return "n/a", "n/a", "n/a"
+        return "n/a", "n/a", "n/a", "n/a"
     ha = heikin_ashi(df)
     ha_c = "Positive" if ha.close.iloc[-1] > ha.open.iloc[-1] else "Negative"
     rg_c = "Positive" if df.close.iloc[-1] > df.open.iloc[-1] else "Negative"
@@ -208,15 +209,18 @@ def classify(df):
         both = "YES - Positive"
     elif ha_c == rg_c == "Negative":
         both = "YES - Negative"
-    return ha_c, rg_c, both
+    diff = df.close.iloc[-1] - ha.close.iloc[-1]
+    vs = "Up" if diff > 0 else "Down" if diff < 0 else "Flat"
+    return ha_c, rg_c, both, vs
 
 
 def scan_one(headers, symbol, sec_id, tfs):
     row = {"Symbol": symbol}
     frames = get_frames(headers, sec_id, tfs)
     for tf in tfs:
-        ha_c, rg_c, both = classify(frames[tf])
+        ha_c, rg_c, both, vs = classify(frames[tf])
         row[f"{tf} HA"], row[f"{tf} Candle"], row[f"{tf} Both"] = ha_c, rg_c, both
+        row[f"{tf} Close vs HA"] = vs
     boths = [row[f"{tf} Both"] for tf in tfs]
     row["All TFs"] = (
         "ALL POSITIVE" if all(b == "YES - Positive" for b in boths)
@@ -228,8 +232,8 @@ def scan_one(headers, symbol, sec_id, tfs):
 # ---------------------------------------------------------------- UI
 st.title("NSE Heikin-Ashi Scanner (Dhan)")
 st.caption(
-    "Latest completed candle per timeframe. 'Both' = YES when the Heikin-Ashi candle and the "
-    "regular candle are the same colour (green/green or red/red). 30m and 1H are built from 5m data."
+    "Latest completed candle per timeframe. 'Close vs HA' = Up when the regular close is above the Heikin-Ashi close, Down when below. 'Both' = YES when the Heikin-Ashi candle and the "
+    "regular candle are the same colour (green/green or red/red). 15m, 30m and 1H are built from 5m data."
 )
 
 client_id, token = get_creds()
@@ -321,6 +325,10 @@ if "res" in st.session_state:
         view = view[view["All TFs"] == allt]
 
     def color(v):
+        if v == "Up":
+            return "background-color:#c8f7c5;color:#064"
+        if v == "Down":
+            return "background-color:#f9c9c9;color:#800"
         if isinstance(v, str) and ("Positive" in v or "POSITIVE" in v):
             return "background-color:#c8f7c5;color:#064"
         if isinstance(v, str) and ("Negative" in v or "NEGATIVE" in v):
