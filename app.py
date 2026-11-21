@@ -56,7 +56,9 @@ class Limiter:
             self.last = time.monotonic()
 
 
-LIMITER = Limiter(4.0)  # Dhan data API allows ~5 req/sec; stay under it
+LIMITER = Limiter(2.5)  # Dhan data API allows 5 req/sec; stay well under it
+ABORT = threading.Event()
+THROTTLED = {"n": 0}
 ERRS = {}
 _ERR_LOCK = threading.Lock()
 
@@ -102,18 +104,26 @@ def _to_df(js):
 
 
 def _post(path, body, headers):
-    for _ in range(3):
+    for attempt in range(4):
+        if ABORT.is_set():
+            return None
         LIMITER.wait()
         try:
             r = requests.post(f"{API}{path}", json=body, headers=headers, timeout=25)
             if r.status_code == 200:
+                THROTTLED["n"] = 0
                 js = r.json()
                 if not isinstance(js, dict) or not js.get("close"):
                     note_err(f"HTTP 200 but no candle data: {str(js)[:160]}")
                 return js
-            if r.status_code in (429, 805):
-                note_err(f"HTTP {r.status_code} rate limited (retrying)")
-                time.sleep(2)
+            if r.status_code == 429:
+                note_err("HTTP 429 DH-904 rate limit (backing off)")
+                with _ERR_LOCK:
+                    THROTTLED["n"] += 1
+                    if THROTTLED["n"] >= 10:
+                        ABORT.set()
+                with LIMITER.lock:  # every worker waits behind this pause
+                    LIMITER.last = max(LIMITER.last, time.monotonic() + 5 * (attempt + 1))
                 continue
             note_err(f"HTTP {r.status_code}: {r.text[:200]}")
             return None
@@ -123,32 +133,42 @@ def _post(path, body, headers):
     return None
 
 
-@st.cache_data(ttl=300, show_spinner="Fetching candles...")
-def cached_fetch(cid, tok, sid, tf):
-    h = {"access-token": tok, "client-id": cid, "Content-Type": "application/json",
-         "Accept": "application/json"}
-    return fetch(h, sid, tf)
-
-
-def fetch(headers, sec_id, tf):
+def fetch_raw(headers, sec_id, kind):
+    """kind 'D' = daily candles, '15' = 15-minute candles (all other TFs are built from these)."""
     now = datetime.now()
     base = {"securityId": str(sec_id), "exchangeSegment": "NSE_EQ", "instrument": "EQUITY"}
-    if tf == "1D":
+    if kind == "D":
         body = {**base, "expiryCode": 0, "oi": False,
                 "fromDate": (now - timedelta(days=150)).strftime("%Y-%m-%d"),
                 "toDate": (now + timedelta(days=1)).strftime("%Y-%m-%d")}
         return _to_df(_post("/charts/historical", body, headers))
-    interval, days = ("15", 12) if tf == "30m" else ("60", 30)
-    body = {**base, "interval": interval, "oi": False,
-            "fromDate": (now - timedelta(days=days)).strftime("%Y-%m-%d 09:15:00"),
+    body = {**base, "interval": "15", "oi": False,
+            "fromDate": (now - timedelta(days=20)).strftime("%Y-%m-%d 09:15:00"),
             "toDate": now.strftime("%Y-%m-%d 15:30:00")}
-    df = _to_df(_post("/charts/intraday", body, headers))
-    if df is not None and tf == "30m":
-        # Dhan has no native 30-minute bars: build them from 15-minute bars
-        df = df.resample("30min", offset="15min").agg(
-            {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
-        ).dropna()
-    return df
+    return _to_df(_post("/charts/intraday", body, headers))
+
+
+def resample(df, rule):
+    # sessions start 09:15, so shift bin edges by 15 minutes
+    return df.resample(rule, offset="15min").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    ).dropna()
+
+
+def get_frames(headers, sec_id):
+    """Two API calls per stock -> 1D, 30m and 1H frames."""
+    d = fetch_raw(headers, sec_id, "D")
+    m15 = fetch_raw(headers, sec_id, "15")
+    return {"1D": d,
+            "30m": resample(m15, "30min") if m15 is not None else None,
+            "1H": resample(m15, "60min") if m15 is not None else None}
+
+
+@st.cache_data(ttl=300, show_spinner="Fetching candles...")
+def cached_frames(cid, tok, sid):
+    h = {"access-token": tok, "client-id": cid, "Content-Type": "application/json",
+         "Accept": "application/json"}
+    return get_frames(h, sid)
 
 
 def heikin_ashi(df):
@@ -180,8 +200,9 @@ def classify(df):
 
 def scan_one(headers, symbol, sec_id):
     row = {"Symbol": symbol}
+    frames = get_frames(headers, sec_id)
     for tf in TFS:
-        ha_c, rg_c, both = classify(fetch(headers, sec_id, tf))
+        ha_c, rg_c, both = classify(frames[tf])
         row[f"{tf} HA"], row[f"{tf} Candle"], row[f"{tf} Both"] = ha_c, rg_c, both
     boths = [row[f"{tf} Both"] for tf in TFS]
     row["All TFs"] = (
@@ -206,9 +227,9 @@ with st.sidebar:
     universe = st.selectbox("Universe", ["Nifty 50", "Nifty 100", "Nifty 500", "All NSE EQ", "Custom"])
     custom = st.text_area("Custom symbols (comma separated)", "RELIANCE, TCS, INFY") if universe == "Custom" else ""
     limit = st.number_input("Max stocks (0 = no limit)", 0, 3000, 0)
-    workers = st.slider("Parallel workers", 1, 8, 4)
+    workers = st.slider("Parallel workers", 1, 4, 2)
     run = st.button("Run scan", type="primary", disabled=not (client_id and token))
-    st.caption("All NSE EQ is ~2,000 stocks x 3 calls; at ~4 req/s that is 25+ minutes.")
+    st.caption("All NSE EQ is ~2,000 stocks x 2 calls; at ~2.5 req/s that is well over an hour; start with Nifty 50/100.")
     if st.button("Test connection", disabled=not (client_id and token)):
         try:
             sid0 = load_master().set_index("symbol").security_id.get("RELIANCE")
@@ -235,16 +256,24 @@ if run:
         syms = syms[: int(limit)]
 
     ERRS.clear()
+    ABORT.clear()
+    THROTTLED["n"] = 0
     rows, bar = [], st.progress(0.0, text="Scanning...")
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(scan_one, headers, s, m[s]) for s in syms]
+    ex = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futs = [ex.submit(scan_one, headers, s_, m[s_]) for s_ in syms]
         for i, f in enumerate(as_completed(futs), 1):
             try:
                 rows.append(f.result())
             except Exception:
                 pass
             bar.progress(i / len(futs), text=f"Scanned {i}/{len(futs)}")
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
     bar.empty()
+    if ABORT.is_set():
+        st.error("Dhan kept returning 429 (rate limit), so the scan was stopped. Wait a few minutes, "
+                 "then rerun with a smaller universe or 1 worker.")
     res = pd.DataFrame(rows).sort_values("Symbol").reset_index(drop=True)
     st.session_state["res"] = res
     st.session_state["errs"] = dict(ERRS)
@@ -315,9 +344,10 @@ sid = master.set_index("symbol").security_id.get(sym)
 if not (client_id and token):
     st.info("Enter Dhan credentials to load charts.")
 else:
+    frames = cached_frames(client_id, token, sid)
     for tab, tf in zip(st.tabs(TFS), TFS):
         with tab:
-            df = cached_fetch(client_id, token, sid, tf)
+            df = frames.get(tf)
             if df is None or df.empty:
                 st.warning("No data returned. Press 'Test connection' in the sidebar to see Dhan's error.")
                 continue
