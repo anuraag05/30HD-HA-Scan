@@ -24,7 +24,7 @@ NSE_LISTS = {
     "Nifty 100": "https://archives.nseindia.com/content/indices/ind_nifty100list.csv",
     "Nifty 500": "https://archives.nseindia.com/content/indices/ind_nifty500list.csv",
 }
-TFS = ["1D", "30m", "1H"]
+ALL_TFS = ["1D", "1H", "30m", "5m", "1m"]
 IST = "Asia/Kolkata"
 
 
@@ -139,7 +139,7 @@ def _post(path, body, headers):
 
 
 def fetch_raw(headers, sec_id, kind):
-    """kind 'D' = daily candles, '15' = 15-minute candles (all other TFs are built from these)."""
+    """kind 'D' = daily, '5' = 5-minute, '1' = 1-minute candles."""
     now = datetime.now()
     base = {"securityId": str(sec_id), "exchangeSegment": "NSE_EQ", "instrument": "EQUITY"}
     if kind == "D":
@@ -147,8 +147,9 @@ def fetch_raw(headers, sec_id, kind):
                 "fromDate": (now - timedelta(days=150)).strftime("%Y-%m-%d"),
                 "toDate": (now + timedelta(days=1)).strftime("%Y-%m-%d")}
         return _to_df(_post("/charts/historical", body, headers))
-    body = {**base, "interval": "15", "oi": False,
-            "fromDate": (now - timedelta(days=20)).strftime("%Y-%m-%d 09:15:00"),
+    days = 20 if kind == "5" else 5
+    body = {**base, "interval": kind, "oi": False,
+            "fromDate": (now - timedelta(days=days)).strftime("%Y-%m-%d 09:15:00"),
             "toDate": now.strftime("%Y-%m-%d 15:30:00")}
     return _to_df(_post("/charts/intraday", body, headers))
 
@@ -160,13 +161,20 @@ def resample(df, rule):
     ).dropna()
 
 
-def get_frames(headers, sec_id):
-    """Two API calls per stock -> 1D, 30m and 1H frames."""
-    d = fetch_raw(headers, sec_id, "D")
-    m15 = fetch_raw(headers, sec_id, "15")
-    return {"1D": d,
-            "30m": resample(m15, "30min") if m15 is not None else None,
-            "1H": resample(m15, "60min") if m15 is not None else None}
+def get_frames(headers, sec_id, tfs=tuple(ALL_TFS)):
+    """Up to 3 API calls per stock (daily, 5m, 1m); 30m and 1H are built from the 5m data."""
+    out = {t: None for t in ALL_TFS}
+    if "1D" in tfs:
+        out["1D"] = fetch_raw(headers, sec_id, "D")
+    if any(t in tfs for t in ("5m", "30m", "1H")):
+        m5 = fetch_raw(headers, sec_id, "5")
+        if m5 is not None:
+            out["5m"] = m5
+            out["30m"] = resample(m5, "30min")
+            out["1H"] = resample(m5, "60min")
+    if "1m" in tfs:
+        out["1m"] = fetch_raw(headers, sec_id, "1")
+    return out
 
 
 @st.cache_data(ttl=300, show_spinner="Fetching candles...")
@@ -203,13 +211,13 @@ def classify(df):
     return ha_c, rg_c, both
 
 
-def scan_one(headers, symbol, sec_id):
+def scan_one(headers, symbol, sec_id, tfs):
     row = {"Symbol": symbol}
-    frames = get_frames(headers, sec_id)
-    for tf in TFS:
+    frames = get_frames(headers, sec_id, tfs)
+    for tf in tfs:
         ha_c, rg_c, both = classify(frames[tf])
         row[f"{tf} HA"], row[f"{tf} Candle"], row[f"{tf} Both"] = ha_c, rg_c, both
-    boths = [row[f"{tf} Both"] for tf in TFS]
+    boths = [row[f"{tf} Both"] for tf in tfs]
     row["All TFs"] = (
         "ALL POSITIVE" if all(b == "YES - Positive" for b in boths)
         else "ALL NEGATIVE" if all(b == "YES - Negative" for b in boths) else ""
@@ -221,7 +229,7 @@ def scan_one(headers, symbol, sec_id):
 st.title("NSE Heikin-Ashi Scanner (Dhan)")
 st.caption(
     "Latest completed candle per timeframe. 'Both' = YES when the Heikin-Ashi candle and the "
-    "regular candle are the same colour (green/green or red/red). 30m is built from 15m data."
+    "regular candle are the same colour (green/green or red/red). 30m and 1H are built from 5m data."
 )
 
 client_id, token = get_creds()
@@ -232,9 +240,11 @@ with st.sidebar:
     universe = st.selectbox("Universe", ["Nifty 50", "Nifty 100", "Nifty 500", "All NSE EQ", "Custom"])
     custom = st.text_area("Custom symbols (comma separated)", "RELIANCE, TCS, INFY") if universe == "Custom" else ""
     limit = st.number_input("Max stocks (0 = no limit)", 0, 3000, 0)
+    sel_tfs = st.multiselect("Timeframes", ALL_TFS, default=ALL_TFS)
+    st.caption("Each stock needs 1 call for 1D, 1 for 5m/30m/1H, and 1 for 1m. Untick 1m to scan faster.")
     workers = st.slider("Parallel workers", 1, 4, 2)
-    run = st.button("Run scan", type="primary", disabled=not (client_id and token))
-    st.caption("All NSE EQ is ~2,000 stocks x 2 calls; at ~2.5 req/s that is well over an hour; start with Nifty 50/100.")
+    run = st.button("Run scan", type="primary", disabled=not (client_id and token and sel_tfs))
+    st.caption("All NSE EQ is ~2,000 stocks x up to 3 calls; at ~2.5 req/s that takes hours; start with Nifty 50/100.")
     if st.button("Test connection", disabled=not (client_id and token)):
         try:
             sid0 = load_master().set_index("symbol").security_id.get("RELIANCE")
@@ -260,13 +270,14 @@ if run:
     if limit:
         syms = syms[: int(limit)]
 
+    tfs = [t for t in ALL_TFS if t in sel_tfs]
     ERRS.clear()
     ABORT.clear()
     THROTTLED["n"] = 0
     rows, bar = [], st.progress(0.0, text="Scanning...")
     ex = ThreadPoolExecutor(max_workers=workers)
     try:
-        futs = [ex.submit(scan_one, headers, s_, m[s_]) for s_ in syms]
+        futs = [ex.submit(scan_one, headers, s_, m[s_], tfs) for s_ in syms]
         for i, f in enumerate(as_completed(futs), 1):
             try:
                 rows.append(f.result())
@@ -281,11 +292,13 @@ if run:
                  "then rerun with a smaller universe or 1 worker.")
     res = pd.DataFrame(rows).sort_values("Symbol").reset_index(drop=True)
     st.session_state["res"] = res
+    st.session_state["tfs"] = tfs
     st.session_state["errs"] = dict(ERRS)
     st.session_state["scanned_at"] = datetime.now().strftime("%d %b %Y %H:%M")
 
 if "res" in st.session_state:
     res = st.session_state["res"]
+    TFS = st.session_state.get("tfs", ALL_TFS)
     st.subheader(f"Results - {len(res)} stocks (scanned {st.session_state['scanned_at']})")
 
     ok = res[[f"{t} Both" for t in TFS]].ne("n/a").all(axis=1)
@@ -350,7 +363,7 @@ if not (client_id and token):
     st.info("Enter Dhan credentials to load charts.")
 else:
     frames = cached_frames(client_id, token, sid)
-    for tab, tf in zip(st.tabs(TFS), TFS):
+    for tab, tf in zip(st.tabs(ALL_TFS), ALL_TFS):
         with tab:
             df = frames.get(tf)
             if df is None or df.empty:
